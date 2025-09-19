@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.ipynb_checkpoints
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# data / outputs
+data/
+outputs/
+*.pt
+*.ckpt
+*.log
