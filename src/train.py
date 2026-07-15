@@ -16,6 +16,7 @@ from torch.optim.swa_utils import AveragedModel  # EMA
 from .utils import seed_everything, ensure_dir
 from .config import Config
 from .dataset import preload_images_to_ram
+from .optimization import step_optimizer
 
 IMAGENET_MEAN=(0.485,0.456,0.406); IMAGENET_STD=(0.229,0.224,0.225)
 
@@ -265,6 +266,7 @@ def main():
                 opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                                         lr=args.lr_ft, weight_decay=1e-2)
                 card_txt_cache_train = None
+                card_txt_cache_val = None
 
             opt.zero_grad(set_to_none=True)
             for x_img, toks, y, ids, card_ids in pbar:
@@ -294,15 +296,12 @@ def main():
                     (loss / args.grad_accum).backward()
 
                 if (global_step + 1) % args.grad_accum == 0:
-                    # clip grads
-                    torch.nn.utils.clip_grad_norm_(
+                    step_optimizer(
                         (p for p in model.parameters() if p.requires_grad),
-                        max_norm=args.clip_norm
+                        opt,
+                        max_norm=args.clip_norm,
+                        scaler=scaler if device == "cuda" else None,
                     )
-                    if device == "cuda":
-                        scaler.step(opt); scaler.update()
-                    else:
-                        opt.step()
                     opt.zero_grad(set_to_none=True)
                     # EMA обновление
                     ema.update_parameters(model)
