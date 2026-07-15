@@ -1,163 +1,113 @@
-# Описание решения
+# Cross-Modal Image-Text Relevance
 
-Кросс-модальная модель: изображение (timm) + текст (HF Transformers) с FiLM-модуляцией и EMA.  
-Тренировка по K-fold, инференс по фолдам с усреднением.
+A competition-ready PyTorch pipeline for ranking the relevance of marketplace images to product-card text. It combines a `timm` vision backbone with a Hugging Face text encoder, FiLM-style feature modulation, grouped validation, pairwise ranking loss, and EMA checkpoints.
 
-## Содержание
+## Architecture
 
-- [Установка](#установка)
-  - [Вариант A: как пакет](#вариант-a-как-пакет)
-  - [Вариант B: по requirements.txt](#вариант-b-по-requirementstxt)
-- [Данные](#данные)
-- [Разбиение на фолды](#разбиение-на-фолды)
-- [Тренировка](#тренировка)
-- [Инференс](#инференс)
-- [Требования к окружению](#требования-к-окружению)
+```mermaid
+flowchart LR
+    I[Product image] --> V[timm vision encoder]
+    T[Title + description] --> X[Transformer text encoder]
+    X --> G[Sigmoid gate]
+    V --> M[FiLM modulation]
+    G --> M
+    M --> C[Concatenate features]
+    X --> C
+    C --> H[Binary relevance head]
+```
 
-## Установка
+The text representation produces a gate over the image embedding. The modulated image features and text features are then concatenated and scored by a small MLP.
 
-### Вариант A: как пакет
+## Engineering highlights
 
-```bash
-python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -U pip
+- `GroupKFold` split by product card to prevent related samples leaking across train and validation.
+- Staged fine-tuning: train the fusion head first, then unfreeze both encoders.
+- BCE objective combined with an in-card BPR pairwise ranking loss.
+- Exponential moving average weights for validation and checkpoint selection.
+- Optional image preloading and per-card text embedding caches.
+- Fold ensembling for final predictions.
+- AMP-safe gradient clipping with a focused regression test and GitHub Actions check.
 
-pip install -e .
-````
+## Installation
 
-Появятся консольные команды:
-
-* `make-folds`
-* `fusion-train`
-* `fusion-infer`
-
-### Вариант B: по requirements.txt
+Requires Python 3.10 or newer.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-Запуск модулей: `python -m src.train`, `python -m src.infer`, `python -m src.make_folds`
+This installs three commands: `make-folds`, `fusion-train`, and `fusion-infer`.
 
-## Данные
+## Data
 
-Ожидается структура:
-
-```
-image_relevance_challenge/
-├─ data/
-│  ├─ train.csv             # id, title, description, card_identifier_id, label
-│  ├─ test.csv              # id, title, description, card_identifier_id
-│  └─ images/
-│     ├─ 1.jpg
-│     ├─ 2.jpg
-│     └─ ...
-└─ outputs/                 # чекпойнты и сабмиты будут здесь
+```text
+data/
+├── train.csv   # id, title, description, card_identifier_id, label
+├── test.csv    # id, title, description, card_identifier_id
+└── images/
+    ├── 1.jpg
+    └── ...
 ```
 
-**Обязательные колонки:**
+Each image filename must match its integer `id`. The binary `label` column is required only for training.
 
-* `id` — int, имя файла изображения это `{id}.jpg`
-* `title`, `description` — текст
-* `card_identifier_id` — группировка объектов (для BPR и разбиения по группам)
-* `label` — 0/1 (только для train)
+## Train
 
-## Разбиение на фолды
-
-`make-folds` гарантирует групповой сплит по `card_identifier_id`:
+Create grouped folds:
 
 ```bash
 make-folds --train_csv data/train.csv --n_splits 5
-# создаст data/train_folds5.csv с колонкой fold
 ```
 
-(Аналог: `python -m src.make_folds --train_csv data/train.csv --n_splits 5`)
-
-## Тренировка
+Run the fusion model:
 
 ```bash
 fusion-train \
   --train_csv data/train_folds5.csv \
-  --img_model eva02_base_patch14_448.mim_in22k_ft_in22k_in1k \
   --img_dir data/images \
-  --out_dir outputs/fusion_v3_bigger_img \
+  --out_dir outputs/fusion \
+  --img_model eva02_base_patch14_448.mim_in22k_ft_in22k_in1k \
+  --txt_model deepvk/USER-bge-m3 \
   --image_size 448 \
   --epochs 8 \
   --batch_size 24 \
   --freeze_epochs 2 \
-  --lr_head 1e-3 \
-  --lr_ft 1e-5 \
-  --txt_model deepvk/USER-bge-m3 \
-  --max_len 256 \
   --pair_lambda 0.01 \
-  --pair_warmup_epochs 3 \
-  --clip_norm 1.0 \
   --cache_text \
-  --grad_accum 1 \
   --grad_checkpoint
 ```
 
-Эквивалент через модуль:
+The best EMA checkpoint for each fold is written to `outputs/fusion/folds/fusion_fold{n}.pt`.
 
-```bash
-python -m src.train \
-  --train_csv data/train_folds5.csv \
-  --img_model eva02_base_patch14_448.mim_in22k_ft_in22k_in1k \
-  --img_dir data/images \
-  --out_dir outputs/fusion_v3_bigger_img \
-  --image_size 448 \
-  --epochs 8 \
-  --batch_size 24 \
-  --freeze_epochs 2 \
-  --lr_head 1e-3 \
-  --lr_ft 1e-5 \
-  --txt_model deepvk/USER-bge-m3 \
-  --max_len 256 \
-  --pair_lambda 0.01 \
-  --pair_warmup_epochs 3 \
-  --clip_norm 1.0 \
-  --cache_text \
-  --grad_accum 1 \
-  --grad_checkpoint
-```
-
-**Заметки:**
-
-* `--cache_text` ускоряет этапы, где текстовый энкодер заморожен/фиксирован.
-* `--grad_checkpoint` включится только если выбранная `timm`-модель это поддерживает.
-* EMA включена по умолчанию через `AveragedModel`; сохраняются EMA-веса с наилучшим AUC.
-
-## Инференс
+## Infer
 
 ```bash
 fusion-infer \
   --test_csv data/test.csv \
   --img_dir data/images \
-  --out_dir outputs/fusion_v3_bigger_img \
-  --out_file fusion_eva_qwen.csv \
+  --out_dir outputs/fusion \
   --img_model eva02_base_patch14_448.mim_in22k_ft_in22k_in1k \
   --txt_model deepvk/USER-bge-m3 \
   --image_size 448 \
   --batch_size 64 \
-  --cache_text
+  --cache_text \
+  --preload_ram
 ```
 
-(Или `python -m src.infer` с теми же аргументами.)
+Inference averages predictions across fold checkpoints and writes `outputs/fusion/sub/submission_fusion.csv` by default. Text embeddings are rebuilt after each fold checkpoint is loaded, so cached features always match that fold's encoder weights.
 
-Инференс ожидает чекпойнты по путям:
+## Tests
 
+```bash
+python -m pip install pytest
+pytest -q
 ```
-outputs/fusion_v3_bigger_img/folds/fusion_fold{0..F-1}.pt
-```
 
-где `F` — число фолдов (`--folds` в `config.py` или через аргумент).
+The public repository does not include the competition dataset, trained checkpoints, or a leaderboard result. It contains the complete training and inference implementation needed to reproduce the pipeline with compatible data.
 
-## Требования к окружению
+## License
 
-* Python ≥ 3.10
-* CUDA (опционально). Скрипты сами выберут `cuda`/`mps`/`cpu`.
-* Некоторые модели из timm (например, EVA-02) требуют достаточно свежую версию `timm`.
+[MIT](LICENSE)
