@@ -10,9 +10,11 @@ from tqdm import tqdm
 from .config import Config
 from .utils import ensure_dir
 from .train import FusionModel, FusionDataset, pick_device, mean_pool
+from .dataset import preload_images_to_ram
 
 def build_card_text_cache(model: FusionModel, df: pd.DataFrame, tokenizer, device: str, max_len: int):
     cache = {}
+    was_training = model.txt_enc.training
     model.txt_enc.eval()
     with torch.inference_mode():
         for cid, g in df.groupby("card_identifier_id"):
@@ -25,7 +27,7 @@ def build_card_text_cache(model: FusionModel, df: pd.DataFrame, tokenizer, devic
             else:
                 emb = out.pooler_output
             cache[int(cid)] = emb.detach()
-    model.txt_enc.train()
+    model.txt_enc.train(was_training)
     return cache
 
 def main():
@@ -57,13 +59,19 @@ def main():
     tokenizer = model.txt_tok
 
     # датасет / лоадер
-    ds = FusionDataset(df, args.img_dir, args.image_size, tokenizer, args.max_len, is_train=False, ram_cache=None)
+    ram_cache = preload_images_to_ram(df, args.img_dir) if args.preload_ram else None
+    ds = FusionDataset(
+        df,
+        args.img_dir,
+        args.image_size,
+        tokenizer,
+        args.max_len,
+        is_train=False,
+        ram_cache=ram_cache,
+    )
     nw = 8 if not args.preload_ram else 0
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=nw,
                         pin_memory=True, persistent_workers=(nw > 0))
-
-    # опциональный кэш текстов по карточке (ускоряет инференс)
-    card_txt_cache = build_card_text_cache(model, df, tokenizer, device, args.max_len) if args.cache_text else None
 
     fold_probs = []
     for f in range(args.folds):
@@ -72,6 +80,13 @@ def main():
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state["model"], strict=True)  # это EMA-веса из тренера
         model.eval()
+
+        # Text embeddings must match the encoder weights of the current fold.
+        card_txt_cache = (
+            build_card_text_cache(model, df, tokenizer, device, args.max_len)
+            if args.cache_text
+            else None
+        )
 
         preds = []
         with torch.inference_mode():
